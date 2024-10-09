@@ -1,152 +1,320 @@
 import os
-import requests
 import streamlit as st
-from langchain_core.messages import AIMessage, HumanMessage
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.vectorstores import FAISS
-from dotenv import load_dotenv
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain.chains import create_history_aware_retriever, create_retrieval_chain
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain.schema import Document
+import requests
 from bs4 import BeautifulSoup
+from together import Together
+import pandas as pd
+from wordcloud import WordCloud
+import matplotlib.pyplot as plt
+import nltk
+from nltk.sentiment import SentimentIntensityAnalyzer
+from langdetect import detect, LangDetectException
+from googletrans import Translator
+import plotly.express as px
+import networkx as nx
+from collections import Counter
+import re
+import base64
+from io import BytesIO
+import asyncio
+import aiohttp
+from urllib.parse import urljoin, urlparse
 
-# Load environment variables
-load_dotenv("apikey.env")
-together_api_key = os.getenv("TOGETHER_API_KEY")
+# Download necessary NLTK data
+nltk.download('vader_lexicon', quiet=True)
+nltk.download('punkt', quiet=True)
 
-if not together_api_key:
-    st.error("Together API key is missing. Please check your apikey.env file.")
+# Set up Together API client
+together_api_key = ""
+client = Together(api_key=together_api_key)
 
-# Fetch content from URL
-def fetch_web_content(url):
+# Initialize sentiment analyzer, translator, and other tools
+sia = SentimentIntensityAnalyzer()
+translator = Translator()
+
+# Set page config
+st.set_page_config(page_title="Advanced Website Analyzer", layout="wide", initial_sidebar_state="expanded")
+
+# Custom CSS to improve UI
+st.markdown("""
+<style>
+    .stApp {
+        max-width: 1200px;
+        margin: 0 auto;
+    }
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 24px;
+    }
+    .stTabs [data-baseweb="tab"] {
+        height: 50px;
+        white-space: pre-wrap;
+        background-color: #808080;
+        border-radius: 5px 5px 0px 0px;
+        gap: 10px;
+        padding-top: 10px;
+        padding-bottom: 10px;
+    }
+    .stTabs [aria-selected="true"] {
+        background-color: #ffffff;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+@st.cache_data
+def extract_text_from_url(url):
     try:
-        response = requests.get(url)
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.content, "html.parser")
-            return soup.get_text()
-        else:
-            st.error(f"Failed to fetch content from URL. Status code: {response.status_code}")
-            return None
+        response = requests.get(url, timeout=10)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        return ' '.join([p.text for p in soup.find_all('p')])
     except Exception as e:
-        st.error(f"An error occurred while fetching the URL: {e}")
+        st.error(f"Error extracting text from URL: {e}")
         return None
 
-# Fetch embeddings from Together API
-def get_together_embeddings(documents):
-    headers = {
-        "Authorization": f"Bearer {together_api_key}",
-        "Content-Type": "application/json"
-    }
-    data = {
-        "input": [doc.page_content for doc in documents],  # input expects text, check API documentation
-        "model": "embedding-ada-002"  # Example of using an embedding model
-    }
+@st.cache_data
+def get_summary(text):
+    response = client.chat.completions.create(
+        model="meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant that summarizes text."},
+            {"role": "user", "content": f"Please provide a concise summary of the following text:\n\n{text[:4000]}"}
+        ],
+        max_tokens=512,
+        temperature=0.7,
+    )
+    return response.choices[0].message.content
 
-    response = requests.post("https://api.together.xyz/v1/embeddings", headers=headers, json=data)
+def chat_with_ai(question, context):
+    response = client.chat.completions.create(
+        model="meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant that answers questions based on the given context."},
+            {"role": "user", "content": f"Context: {context[:4000]}\n\nQuestion: {question}"}
+        ],
+        max_tokens=512,
+        temperature=0.7,
+    )
+    return response.choices[0].message.content
 
-    if response.status_code == 200:
-        embeddings = response.json().get("data")
-        if embeddings:
-            return embeddings
-        else:
-            st.error("No embeddings returned from Together API.")
-    else:
-        st.error(f"Error fetching embeddings from Together API. Status Code: {response.status_code}")
-    return None
+@st.cache_data
+def generate_word_cloud(text):
+    wordcloud = WordCloud(width=800, height=400, background_color='white').generate(text)
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.imshow(wordcloud, interpolation='bilinear')
+    ax.axis('off')
+    return fig
 
-# Create vector store from web content
-def get_vectorstore_from_url(url):
-    web_content = fetch_web_content(url)
-    if web_content is None:
-        return None
+@st.cache_data
+def perform_sentiment_analysis(text):
+    sentences = nltk.sent_tokenize(text)
+    sentiments = [sia.polarity_scores(sentence)['compound'] for sentence in sentences]
+    return pd.DataFrame({'sentence': sentences, 'sentiment': sentiments})
 
-    documents = [Document(page_content=web_content)]
-    text_splitter = RecursiveCharacterTextSplitter()
-    document_chunks = text_splitter.split_documents(documents)
+@st.cache_data
+def detect_language(text):
+    try:
+        return detect(text)
+    except LangDetectException:
+        return "Unknown"
 
-    embeddings = get_together_embeddings(document_chunks)
-    if embeddings is None:
-        st.error("Failed to fetch embeddings, cannot proceed with FAISS vector store.")
-        return None
+@st.cache_data
+def translate_text(text, target='en'):
+    try:
+        return translator.translate(text, dest=target).text
+    except Exception as e:
+        st.error(f"Translation error: {e}")
+        return text
 
-    vector_store = FAISS.from_documents(document_chunks, embeddings)
-    return vector_store
+@st.cache_data
+def generate_topic_graph(text):
+    words = re.findall(r'\b\w+\b', text.lower())
+    word_pairs = list(zip(words[:-1], words[1:]))
+    word_counts = Counter(word_pairs)
+    
+    G = nx.Graph()
+    for (word1, word2), count in word_counts.most_common(50):
+        G.add_edge(word1, word2, weight=count)
+    
+    pos = nx.spring_layout(G)
+    edge_x = []
+    edge_y = []
+    for edge in G.edges():
+        x0, y0 = pos[edge[0]]
+        x1, y1 = pos[edge[1]]
+        edge_x.extend([x0, x1, None])
+        edge_y.extend([y0, y1, None])
 
-# Function to handle Together chat API responses
-def together_chat_api(prompt):
-    headers = {
-        "Authorization": f"Bearer {together_api_key}",
-        "Content-Type": "application/json"
-    }
-    data = {
-        "prompt": prompt
-    }
-    response = requests.post("https://api.together.xyz/v1/chat", headers=headers, json=data)
+    edge_trace = px.line(x=edge_x, y=edge_y).data[0]
+    edge_trace.line.width = 0.5
+    edge_trace.line.color = '#888'
 
-    if response.status_code == 200:
-        return response.json().get("reply")
-    else:
-        st.error(f"Error getting response from Together API. Status code: {response.status_code}")
-        return None
+    node_x = [pos[node][0] for node in G.nodes()]
+    node_y = [pos[node][1] for node in G.nodes()]
 
-# Context retriever chain
-def get_context_retriever_chain(vector_store):
-    retriever = vector_store.as_retriever()
-    prompt = ChatPromptTemplate.from_messages([
-        MessagesPlaceholder(variable_name="chat_history"),
-        ("user", "{input}"),
-        ("user", "Generate a search query based on the conversation.")
-    ])
-    retriever_chain = create_history_aware_retriever(together_chat_api, retriever, prompt)
-    return retriever_chain
+    node_trace = px.scatter(x=node_x, y=node_y, text=list(G.nodes())).data[0]
+    node_trace.marker.size = 10
+    node_trace.marker.color = '#007bff'
+    node_trace.text = list(G.nodes())
+    node_trace.textposition = 'top center'
 
-# Conversational RAG chain
-def get_conversational_rag_chain(retriever_chain):
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", "Answer the user's questions based on the context:\n\n{context}"),
-        MessagesPlaceholder(variable_name="chat_history"),
-        ("user", "{input}"),
-    ])
-    stuff_documents_chain = create_stuff_documents_chain(together_chat_api, prompt)
-    return create_retrieval_chain(retriever_chain, stuff_documents_chain)
+    fig = px.scatter(x=node_x, y=node_y, text=list(G.nodes()))
+    fig.add_trace(edge_trace)
+    fig.add_trace(node_trace)
+    fig.update_layout(showlegend=False, title="Topic Relationship Graph")
+    fig.update_xaxes(showticklabels=False)
+    fig.update_yaxes(showticklabels=False)
+    
+    return fig
 
-# Generate response
-def get_response(user_input):
-    retriever_chain = get_context_retriever_chain(st.session_state.vector_store)
-    conversation_rag_chain = get_conversational_rag_chain(retriever_chain)
+def get_table_download_link(df):
+    csv = df.to_csv(index=False)
+    b64 = base64.b64encode(csv.encode()).decode()
+    href = f'<a href="data:file/csv;base64,{b64}" download="data.csv" class="streamlit-button">Download CSV file</a>'
+    return href
 
-    response = conversation_rag_chain.invoke({
-        "chat_history": st.session_state.chat_history,
-        "input": user_input
-    })
+@st.cache_data
+def get_summary(text, max_tokens=2024):
+    response = client.chat.completions.create(
+        model="meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant that summarizes text."},
+            {"role": "user", "content": f"Please provide a concise summary of the following text:\n\n{text[:4000]}"}
+        ],
+        max_tokens=max_tokens,
+        temperature=0.7,
+    )
+    return response.choices[0].message.content
 
-    return response['answer']
+async def crawl_website(url, max_pages=10):
+    visited = set()
+    to_visit = [url]
+    results = []
 
-# App config
-st.set_page_config(page_title="Chat with Websites", page_icon="🤖")
-st.title("Chat with Websites")
+    async with aiohttp.ClientSession() as session:
+        while to_visit and len(visited) < max_pages:
+            current_url = to_visit.pop(0)
+            if current_url in visited:
+                continue
 
-# Sidebar input
-with st.sidebar:
-    st.header("Settings")
-    website_url = st.text_input("Website URL")
+            try:
+                async with session.get(current_url, timeout=10) as response:
+                    if response.status == 200:
+                        html = await response.text()
+                        soup = BeautifulSoup(html, 'html.parser')
+                        text = ' '.join([p.text for p in soup.find_all('p')])
+                        summary = get_summary(text)
+                        results.append({'url': current_url, 'text': text, 'summary': summary})
+                        visited.add(current_url)
 
-if website_url:
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = [AIMessage(content="Hello, I am a bot. How can I help you?")]
+                        for link in soup.find_all('a', href=True):
+                            new_url = urljoin(current_url, link['href'])
+                            if urlparse(new_url).netloc == urlparse(url).netloc and new_url not in visited:
+                                to_visit.append(new_url)
+            except Exception as e:
+                st.warning(f"Error crawling {current_url}: {e}")
 
-    if "vector_store" not in st.session_state:
-        st.session_state.vector_store = get_vectorstore_from_url(website_url)
+    return results
 
-    user_query = st.chat_input("Type your message here...")
-    if user_query:
-        response = get_response(user_query)
-        st.session_state.chat_history.append(HumanMessage(content=user_query))
-        st.session_state.chat_history.append(AIMessage(content=response))
+def main():
+    st.title("🌐 Advanced Website Analyzer")
+    st.write("Enter a website URL to analyze its content, get insights, and interact with AI!")
 
-    for message in st.session_state.chat_history:
-        if isinstance(message, AIMessage):
-            st.chat_message("AI", content=message.content)
-        elif isinstance(message, HumanMessage):
-            st.chat_message("Human", content=message.content)
+    url = st.text_input("Enter website URL:")
+    
+    if url:
+        tabs = st.tabs(["Summary", "Chat", "Statistics", "Sentiment", "Language", "Topics", "Web Crawler"])
+        
+        with st.spinner("Analyzing website..."):
+            text = extract_text_from_url(url)
+            
+            if text:
+                with tabs[0]:
+                    st.subheader("📝 Website Summary")
+                    summary = get_summary(text)
+                    st.write(summary)
+                
+                with tabs[1]:
+                    st.subheader("💬 Chat with AI about the website")
+                    if 'chat_history' not in st.session_state:
+                        st.session_state.chat_history = []
+
+                    for message in st.session_state.chat_history:
+                        st.write(f"{'You' if message['role'] == 'user' else 'AI'}: {message['content']}")
+
+                    question = st.text_input("Ask a question about the website content:")
+                    if question:
+                        answer = chat_with_ai(question, text)
+                        st.session_state.chat_history.append({"role": "user", "content": question})
+                        st.session_state.chat_history.append({"role": "assistant", "content": answer})
+                        st.write("AI:", answer)
+                
+                with tabs[2]:
+                    st.subheader("📊 Text Statistics")
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        word_count = len(text.split())
+                        st.metric("Word count", word_count)
+                        
+                        st.subheader("🔠 Word Cloud")
+                        word_cloud_fig = generate_word_cloud(text)
+                        st.pyplot(word_cloud_fig)
+                    
+                    with col2:
+                        st.subheader("📈 Top Words")
+                        word_freq = pd.Series(text.split()).value_counts().head(10)
+                        fig = px.bar(x=word_freq.index, y=word_freq.values)
+                        fig.update_layout(xaxis_title="Word", yaxis_title="Frequency")
+                        st.plotly_chart(fig)
+                
+                with tabs[3]:
+                    st.subheader("😊 Sentiment Analysis")
+                    sentiment_df = perform_sentiment_analysis(text)
+                    fig = px.histogram(sentiment_df, x='sentiment', nbins=20)
+                    fig.update_layout(xaxis_title="Sentiment Score", yaxis_title="Frequency")
+                    st.plotly_chart(fig)
+                    
+                    st.write("Sentiment Distribution")
+                    st.dataframe(sentiment_df)
+                    st.markdown(get_table_download_link(sentiment_df), unsafe_allow_html=True)
+                
+                with tabs[4]:
+                    st.subheader("🌍 Language Detection and Translation")
+                    detected_lang = detect_language(text)
+                    st.write(f"Detected language: {detected_lang}")
+                    
+                    target_lang = st.selectbox("Select target language for translation:", ['en', 'es', 'fr', 'de', 'it', 'ja', 'ko', 'zh-cn'])
+                    if st.button("Translate"):
+                        translated_text = translate_text(text[:1000], target_lang)
+                        st.write("Translated text (first 1000 characters):")
+                        st.write(translated_text)
+                
+                with tabs[5]:
+                    st.subheader("🕸️ Topic Relationship Graph")
+                    topic_graph = generate_topic_graph(text)
+                    st.plotly_chart(topic_graph)
+                
+                with tabs[6]:
+                    st.subheader("🕷️ Web Crawler")
+                    max_pages = st.slider("Maximum number of pages to crawl", min_value=1, max_value=50, value=10)
+                    
+                    if st.button("Start Crawling"):
+                        with st.spinner("Crawling website..."):
+                            crawl_results = asyncio.run(crawl_website(url, max_pages))
+                            st.session_state.crawl_results = crawl_results
+                            st.success(f"Crawled {len(crawl_results)} pages.")
+
+                    if hasattr(st.session_state, 'crawl_results'):
+                        for i, result in enumerate(st.session_state.crawl_results):
+                            with st.expander(f"Page {i+1}: {result['url']}"):
+                                if st.button(f"Summarize Page {i+1}", key=f"summarize_{i}"):
+                                    with st.spinner("Generating summary..."):
+                                        summary = get_summary(result['text'], max_tokens=2024)
+                                        st.write("Summary:")
+                                        st.write(summary)
+                                st.write("Full text:")
+                                st.write(result['text'][:500] + "...")
+            else:
+                st.error("Failed to extract text from the given URL. Please try another website.")
+
+
+if __name__ == "__main__":
+    main()
